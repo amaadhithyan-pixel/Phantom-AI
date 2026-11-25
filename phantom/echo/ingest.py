@@ -8,6 +8,8 @@ crashes on bad input.
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -16,7 +18,10 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-SUPPORTED_FORMATS = {".wav", ".mp3", ".flac", ".m4a"}
+# Phone recorders and messaging apps: WhatsApp voice notes are .opus/.ogg, many
+# Android recorders save .amr/.3gp/.aac. ffmpeg converts all of them.
+SUPPORTED_FORMATS = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".opus", ".aac", ".amr", ".3gp",
+                     ".webm", ".mp4", ".wma"}
 MAX_DURATION_S = 600  # 10 minutes, per docs/ECHO_SCOPE.md
 TARGET_SAMPLE_RATE = 16000
 SILENCE_RMS_THRESHOLD = 1e-4
@@ -41,9 +46,22 @@ class IngestedAudio:
     quality: AudioQualityReport
 
 
+def ffmpeg_binary() -> str:
+    """$FFMPEG_BINARY if set, else `ffmpeg` from PATH."""
+    explicit = os.environ.get("FFMPEG_BINARY")
+    if explicit:
+        return explicit
+    found = shutil.which("ffmpeg")
+    if not found:
+        raise IngestError(
+            "ffmpeg not found: install it and put it on PATH, or set FFMPEG_BINARY"
+        )
+    return found
+
+
 def _ffmpeg_convert(src: Path, dst: Path) -> None:
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        ffmpeg_binary(), "-y", "-loglevel", "error",
         "-i", str(src),
         "-ac", "1", "-ar", str(TARGET_SAMPLE_RATE),
         str(dst),
@@ -77,6 +95,7 @@ def _quality_check(wav_path: Path) -> AudioQualityReport:
 
 def ingest(path: str | Path, work_dir: str | Path | None = None) -> IngestedAudio:
     path = Path(path)
+    work_dir = work_dir or Path(tempfile.gettempdir()) / "echo_ingest"
     if not path.exists():
         raise IngestError(f"file not found: {path}")
     ext = path.suffix.lower()
@@ -85,10 +104,7 @@ def ingest(path: str | Path, work_dir: str | Path | None = None) -> IngestedAudi
             f"unsupported audio format: {ext} (supported: {sorted(SUPPORTED_FORMATS)})"
         )
 
-    if work_dir is None:
-        work_dir = Path(tempfile.mkdtemp(prefix="phantom_echo_"))
-    else:
-        work_dir = Path(work_dir)
+    work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     normalized = work_dir / f"{path.stem}.norm.wav"
     _ffmpeg_convert(path, normalized)
