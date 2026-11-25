@@ -9,6 +9,7 @@ crashes on bad input.
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,7 +75,7 @@ def _quality_check(wav_path: Path) -> AudioQualityReport:
     return AudioQualityReport(round(duration, 2), sr, round(rms, 6), issues)
 
 
-def ingest(path: str | Path, work_dir: str | Path = "/tmp/echo_ingest") -> IngestedAudio:
+def ingest(path: str | Path, work_dir: str | Path | None = None) -> IngestedAudio:
     path = Path(path)
     if not path.exists():
         raise IngestError(f"file not found: {path}")
@@ -84,7 +85,10 @@ def ingest(path: str | Path, work_dir: str | Path = "/tmp/echo_ingest") -> Inges
             f"unsupported audio format: {ext} (supported: {sorted(SUPPORTED_FORMATS)})"
         )
 
-    work_dir = Path(work_dir)
+    if work_dir is None:
+        work_dir = Path(tempfile.mkdtemp(prefix="phantom_echo_"))
+    else:
+        work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     normalized = work_dir / f"{path.stem}.norm.wav"
     _ffmpeg_convert(path, normalized)
