@@ -1,4 +1,4 @@
-"""FastAPI app. MIRAGE and ECHO are complete pipelines; BLACKBOX is still a mock."""
+"""FastAPI app (Day 12). MIRAGE is a complete pipeline; ECHO and BLACKBOX are mocks."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from phantom.common.evidence_store import EvidenceStore
-from phantom.common.schemas import ModuleName, ToolResult
-from phantom.echo.analyze import analyze_audio
-from phantom.echo.analyze import overall_outcome as echo_overall_outcome
+from phantom.common.schemas import ModuleName, ToolError, ToolResult
+from phantom.echo.ingest import IngestError as EchoIngestError
+from phantom.echo.ingest import ingest as echo_ingest
 from phantom.mirage.analyze import analyze_document, overall_outcome
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -24,7 +24,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 store = EvidenceStore(REPO_ROOT / "evidence_store")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEMO_DIR = REPO_ROOT / "data" / "demo"
-ECHO_DEMO_DIR = REPO_ROOT / "data" / "demo_echo"
 EVAL_FILES = {
     "holdout_hard": REPO_ROOT / "docs" / "mirage_eval_holdout_hard.json",
     "holdout_hard_final": REPO_ROOT / "docs" / "mirage_eval_holdout_hard_final.json",
@@ -33,13 +32,6 @@ EVAL_FILES = {
     "findit_val_baseline": REPO_ROOT / "docs" / "mirage_eval_findit_val_baseline.json",
     "findit_val": REPO_ROOT / "docs" / "mirage_eval_findit_val.json",
     "findit_test": REPO_ROOT / "docs" / "mirage_eval_findit_test.json",
-    "echo_calls_dev": REPO_ROOT / "docs" / "echo_eval_calls_dev.json",
-    "echo_calls_test": REPO_ROOT / "docs" / "echo_eval_calls_test.json",
-    "echo_librispeech": REPO_ROOT / "docs" / "echo_eval_librispeech.json",
-    "echo_librispeech_other": REPO_ROOT / "docs" / "echo_eval_librispeech_other.json",
-    "echo_public": REPO_ROOT / "docs" / "echo_eval_public.json",
-    "echo_public_frozen": REPO_ROOT / "docs" / "echo_eval_public_frozen.json",
-    "echo_hybrid": REPO_ROOT / "docs" / "echo_eval_hybrid.json",
 }
 # Real receipts are third-party data (Find it again!): never committed, served only
 # from a local download (data/raw/findit2), listed by docs/findit_demo_cases.json.
@@ -98,11 +90,7 @@ def mirage_eval() -> dict:
     for name, path in EVAL_FILES.items():
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, list):  # e.g. one entry per public dataset
-                out[name] = [{k: v for k, v in d.items() if k not in ("rows", "examples")}
-                             for d in data]
-            else:
-                out[name] = {k: v for k, v in data.items() if k != "rows"}
+            out[name] = {k: v for k, v in data.items() if k != "rows"}
     return out
 
 
@@ -143,53 +131,25 @@ def _mock(module: ModuleName) -> ToolResult:
 
 @app.post("/echo/analyze", response_model=ToolResult)
 async def echo_analyze(file: UploadFile = File(...)) -> ToolResult:
-    """Full ECHO pipeline: validate audio, transcribe locally (Whisper), extract
-    claims, detect social-engineering indicators. Transcript and claims are in
-    result.artifacts; see docs/ECHO_EVAL.md for accuracy and limitations."""
+    """Audio is validated and normalized; claim extraction is not built yet
+    (Week 3), so this always reports needs_human_review with no findings."""
     data = await file.read()
     suffix = Path(file.filename or "").suffix
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(data)
+    result = ToolResult(module=ModuleName.ECHO)
     try:
-        return analyze_audio(tmp.name, store, source=file.filename or "upload")
+        audio = echo_ingest(tmp.name)
+        evidence_id = store.put(data, kind="audio", source=file.filename or "upload")
+        result.evidence_ids.append(evidence_id)
+        if audio.quality.issues:
+            result.limitations.append(f"audio quality issues: {', '.join(audio.quality.issues)}")
+    except EchoIngestError as e:
+        result.errors.append(ToolError(code="ingest_failed", message=str(e)))
     finally:
         Path(tmp.name).unlink(missing_ok=True)
-
-
-@app.post("/echo/verdict")
-def echo_verdict(result: ToolResult) -> dict:
-    return {"verdict": echo_overall_outcome(result).value}
-
-
-@app.get("/demo/echo-cases")
-def demo_echo_cases() -> dict:
-    manifest = ECHO_DEMO_DIR / "manifest.json"
-    return json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {"cases": []}
-
-
-@app.get("/demo/echo-cases/{name}")
-def demo_echo_case_file(name: str) -> FileResponse:
-    path = (ECHO_DEMO_DIR / name).resolve()
-    if path.parent != ECHO_DEMO_DIR.resolve() or not path.is_file():
-        raise HTTPException(404, "demo case not found")
-    return FileResponse(path)
-
-
-@app.get("/evidence/{evidence_id}/audio")
-def evidence_audio(evidence_id: str) -> Response:
-    """Stream a stored audio evidence item, so the UI plays exactly what was analysed."""
-    try:
-        blob, record = store.get(evidence_id)
-    except KeyError as e:
-        raise HTTPException(404, "evidence not found") from e
-    if record.get("kind") != "audio":
-        raise HTTPException(400, "evidence item is not audio")
-    ext = Path(record.get("source", "")).suffix.lower()
-    media = {".mp3": "audio/mpeg", ".flac": "audio/flac", ".m4a": "audio/mp4",
-             ".mp4": "audio/mp4", ".aac": "audio/aac", ".ogg": "audio/ogg",
-             ".opus": "audio/ogg", ".webm": "audio/webm", ".amr": "audio/amr",
-             ".3gp": "audio/3gpp", ".wma": "audio/x-ms-wma"}.get(ext, "audio/wav")
-    return Response(blob, media_type=media)
+    result.limitations.append("claim extraction not implemented yet: ingestion/validation only")
+    return result
 
 
 @app.post("/blackbox/investigate", response_model=ToolResult)
